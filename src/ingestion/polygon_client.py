@@ -1,677 +1,426 @@
-"""
-Athena Trading Signal Detection System
-Polygon.io API Client Wrapper
-
-This module provides a comprehensive wrapper for Polygon.io API interactions,
-handling both historical data ingestion and real-time streaming for options and stocks.
-"""
-
+# src/ingestion/polygon_client.py
 import asyncio
+import aiohttp
+import logging
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Callable
 import json
 import time
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Union, AsyncGenerator, Any
-from pathlib import Path
-import logging
-
-import requests
-import websockets
-import pandas as pd
-import polars as pl
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from dataclasses import dataclass
-from enum import Enum
+from pathlib import Path
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-class DataType(Enum):
-    """Supported data types from Polygon"""
-    STOCK_TRADES = "stock_trades"
-    STOCK_AGGREGATES = "stock_aggregates"
-    OPTIONS_TRADES = "options_trades"
-    OPTIONS_AGGREGATES = "options_aggregates"
-    MARKET_STATUS = "market_status"
-
-
 @dataclass
-class PolygonConfig:
-    """Configuration for Polygon API client"""
-    api_key: str
-    base_url: str = "https://api.polygon.io"
-    websocket_url: str = "wss://socket.polygon.io"
-    max_retries: int = 3
-    backoff_factor: float = 1.0
-    timeout: int = 30
-    rate_limit_per_minute: int = 100  # Adjust based on your plan
-
-
-class RateLimiter:
-    """Simple rate limiter for API calls"""
-    
-    def __init__(self, max_calls: int, time_window: int = 60):
-        self.max_calls = max_calls
-        self.time_window = time_window
-        self.calls = []
-    
-    def wait_if_needed(self):
-        """Wait if rate limit would be exceeded"""
-        now = time.time()
-        # Remove calls outside the time window
-        self.calls = [call_time for call_time in self.calls 
-                     if now - call_time < self.time_window]
-        
-        if len(self.calls) >= self.max_calls:
-            sleep_time = self.time_window - (now - self.calls[0]) + 1
-            if sleep_time > 0:
-                logger.info(f"Rate limit reached. Sleeping for {sleep_time:.1f} seconds")
-                time.sleep(sleep_time)
-        
-        self.calls.append(now)
-
+class RateLimitConfig:
+    """Rate limiting configuration for Polygon.io API"""
+    requests_per_minute: int = 100  # Adjust based on your Polygon plan
+    concurrent_requests: int = 10   # Max concurrent requests
+    retry_attempts: int = 3
+    backoff_factor: float = 1.5
 
 class PolygonClient:
     """
-    Comprehensive Polygon.io API client for Athena trading system
-    
-    Features:
-    - Rate limiting and retry logic
-    - Both REST and WebSocket support  
-    - Automatic data validation and cleaning
-    - Export to multiple formats (parquet, CSV, JSON)
-    - Market calendar integration
-    - Error handling and logging
+    Scalable Polygon.io client designed to handle 5000+ tickers efficiently
+    with proper rate limiting, error handling, and batch processing
     """
     
-    def __init__(self, config: PolygonConfig):
-        self.config = config
-        self.rate_limiter = RateLimiter(config.rate_limit_per_minute)
+    def __init__(self, api_key: str, rate_limit_config: RateLimitConfig = None):
+        self.api_key = api_key
+        self.base_url = "https://api.polygon.io"
+        self.rate_limit = rate_limit_config or RateLimitConfig()
+        self.session = None
+        self._request_times = []
+        self._semaphore = None
         
-        # Setup HTTP session with retry strategy
-        self.session = requests.Session()
-        retry_strategy = Retry(
-            total=config.max_retries,
-            backoff_factor=config.backoff_factor,
-            status_forcelist=[429, 500, 502, 503, 504]
+    async def __aenter__(self):
+        """Async context manager entry"""
+        connector = aiohttp.TCPConnector(
+            limit=50,  # Total connection limit
+            limit_per_host=20  # Per-host connection limit
         )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
         
-        # Set default headers
-        self.session.headers.update({
-            'Authorization': f'Bearer {config.api_key}',
-            'User-Agent': 'Athena-Trading-System/1.0'
-        })
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={'User-Agent': 'Athena-Trading-System/1.0'}
+        )
+        
+        # Semaphore for controlling concurrent requests
+        self._semaphore = asyncio.Semaphore(self.rate_limit.concurrent_requests)
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit"""
+        if self.session:
+            await self.session.close()
     
-    def _make_request(self, endpoint: str, params: Dict = None) -> Dict:
-        """Make a rate-limited HTTP request to Polygon API"""
-        self.rate_limiter.wait_if_needed()
+    async def _rate_limit_check(self):
+        """Check and enforce rate limiting"""
+        now = time.time()
         
-        url = f"{self.config.base_url}{endpoint}"
+        # Remove requests older than 1 minute
+        self._request_times = [t for t in self._request_times if now - t < 60]
         
-        try:
-            response = self.session.get(
-                url, 
-                params=params, 
-                timeout=self.config.timeout
-            )
-            response.raise_for_status()
-            return response.json()
+        # If we're at the rate limit, wait
+        if len(self._request_times) >= self.rate_limit.requests_per_minute:
+            sleep_time = 61 - (now - self._request_times[0])
+            if sleep_time > 0:
+                logger.info(f"Rate limit reached, sleeping for {sleep_time:.2f} seconds")
+                await asyncio.sleep(sleep_time)
         
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed: {e}")
-            raise
+        self._request_times.append(now)
     
-    def get_market_status(self) -> Dict:
-        """Get current market status"""
-        return self._make_request("/v1/marketstatus/now")
-    
-    def get_market_calendar(self, start_date: str, end_date: str) -> List[Dict]:
-        """Get market calendar for date range"""
-        params = {'start': start_date, 'end': end_date}
-        response = self._make_request("/v1/marketstatus/upcoming", params)
+    async def _make_request(self, url: str, params: Dict) -> Optional[Dict]:
+        """Make a rate-limited API request with retries"""
+        params['apikey'] = self.api_key
         
-        # Handle different response formats
-        if isinstance(response, list):
-            return response
-        elif isinstance(response, dict):
-            return response.get('results', [])
-        else:
-            logger.warning(f"Unexpected calendar response format: {type(response)}")
-            return []
-    
-    def is_market_open(self) -> bool:
-        """Check if market is currently open"""
-        try:
-            status = self.get_market_status()
-            return status.get('market', 'closed') == 'open'
-        except Exception as e:
-            logger.error(f"Failed to check market status: {e}")
-            return False
-    
-    # STOCK DATA METHODS
-    
-    def get_stock_trades(
-        self, 
-        symbol: str, 
-        date: str,
-        timestamp_gte: Optional[str] = None,
-        timestamp_lte: Optional[str] = None,
-        limit: int = 50000
-    ) -> pl.DataFrame:
-        """
-        Get stock trades for a specific symbol and date
-        
-        Args:
-            symbol: Stock symbol (e.g., 'AAPL')
-            date: Date in YYYY-MM-DD format
-            timestamp_gte: Minimum timestamp (inclusive)
-            timestamp_lte: Maximum timestamp (inclusive)  
-            limit: Max number of results
-        
-        Returns:
-            Polars DataFrame with trade data
-        """
-        endpoint = f"/v3/trades/{symbol}"
-        params = {
-            'timestamp.date': date,
-            'limit': limit
-        }
-        
-        if timestamp_gte:
-            params['timestamp.gte'] = timestamp_gte
-        if timestamp_lte:
-            params['timestamp.lte'] = timestamp_lte
-        
-        response = self._make_request(endpoint, params)
-        trades = response.get('results', [])
-        
-        if not trades:
-            logger.warning(f"No trades found for {symbol} on {date}")
-            return pl.DataFrame()
-        
-        # Convert to DataFrame with proper schema
-        df = pl.DataFrame(trades)
-        
-        # Standardize column names and types
-        if not df.is_empty():
-            df = df.rename({
-                't': 'timestamp_ns',
-                'y': 'timestamp_utc', 
-                'p': 'price',
-                's': 'size',
-                'x': 'exchange',
-                'c': 'conditions',
-                'i': 'id',
-                'z': 'tape'
-            })
+        async with self._semaphore:
+            await self._rate_limit_check()
             
-            # Convert timestamp to datetime
-            df = df.with_columns([
-                pl.from_epoch(pl.col('timestamp_ns'), time_unit='ns').alias('timestamp_utc'),
-                pl.lit(symbol).alias('symbol')
-            ])
-        
-        return df
+            for attempt in range(self.rate_limit.retry_attempts):
+                try:
+                    async with self.session.get(url, params=params) as response:
+                        if response.status == 200:
+                            return await response.json()
+                        elif response.status == 429:  # Rate limited
+                            wait_time = self.rate_limit.backoff_factor ** attempt
+                            logger.warning(f"Rate limited, waiting {wait_time}s (attempt {attempt + 1})")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            logger.error(f"API error {response.status} for {url}")
+                            return None
+                            
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout for {url} (attempt {attempt + 1})")
+                    await asyncio.sleep(self.rate_limit.backoff_factor ** attempt)
+                except Exception as e:
+                    logger.error(f"Request error for {url}: {e}")
+                    await asyncio.sleep(self.rate_limit.backoff_factor ** attempt)
+            
+            logger.error(f"Failed to fetch {url} after {self.rate_limit.retry_attempts} attempts")
+            return None
     
-    def get_stock_aggregates(
-        self,
-        symbol: str,
-        multiplier: int = 1,
-        timespan: str = 'minute',
-        from_date: str = None,
-        to_date: str = None,
-        limit: int = 50000
-    ) -> pl.DataFrame:
+    async def get_stock_bars(self, symbol: str, from_date: str, to_date: str, 
+                           timespan: str = "minute", multiplier: int = 1) -> List[Dict]:
         """
-        Get stock aggregate bars
-        
+        Get stock price bars for a symbol
         Args:
-            symbol: Stock symbol
-            multiplier: Size of timespan multiplier  
-            timespan: Size of time window ('minute', 'hour', 'day')
+            symbol: Stock ticker (e.g., 'AAPL')
             from_date: Start date (YYYY-MM-DD)
             to_date: End date (YYYY-MM-DD)
-            limit: Max results
-        
-        Returns:
-            Polars DataFrame with aggregate data
+            timespan: minute, hour, day, week, month, quarter, year
+            multiplier: Size of the timespan (e.g., 5 for 5-minute bars)
         """
-        endpoint = f"/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{from_date}/{to_date}"
-        params = {'limit': limit, 'adjusted': 'true', 'sort': 'asc'}
-        
-        response = self._make_request(endpoint, params)
-        results = response.get('results', [])
-        
-        if not results:
-            logger.warning(f"No aggregates found for {symbol}")
-            return pl.DataFrame()
-        
-        df = pl.DataFrame(results)
-        
-        if not df.is_empty():
-            df = df.rename({
-                't': 'timestamp_ms',
-                'o': 'open',
-                'h': 'high', 
-                'l': 'low',
-                'c': 'close',
-                'v': 'volume',
-                'vw': 'vwap',
-                'n': 'transactions'
-            })
-            
-            # Convert timestamp
-            df = df.with_columns([
-                pl.from_epoch(pl.col('timestamp_ms'), time_unit='ms').alias('timestamp_utc'),
-                pl.lit(symbol).alias('symbol')
-            ])
-        
-        return df
-    
-    # OPTIONS DATA METHODS
-    
-    def get_options_contracts(
-        self,
-        underlying_ticker: str,
-        contract_type: Optional[str] = None,
-        expiration_date: Optional[str] = None,
-        strike_price: Optional[float] = None,
-        limit: int = 1000
-    ) -> pl.DataFrame:
-        """
-        Get options contracts for underlying ticker
-        
-        Args:
-            underlying_ticker: Underlying stock symbol
-            contract_type: 'call' or 'put'
-            expiration_date: Contract expiration date
-            strike_price: Strike price
-            limit: Max results
-        
-        Returns:
-            DataFrame with contract details
-        """
-        endpoint = "/v3/reference/options/contracts"
+        url = f"{self.base_url}/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{from_date}/{to_date}"
         params = {
-            'underlying_ticker': underlying_ticker,
-            'limit': limit
+            "adjusted": "true",
+            "sort": "asc",
+            "limit": 50000
+        }
+        
+        data = await self._make_request(url, params)
+        if data and data.get('status') == 'OK':
+            return data.get('results', [])
+        return []
+    
+    async def get_options_contracts(self, underlying: str, 
+                                  contract_type: str = None,
+                                  expiration_date: str = None,
+                                  strike_price: float = None) -> List[Dict]:
+        """
+        Get options contracts for an underlying symbol
+        """
+        url = f"{self.base_url}/v3/reference/options/contracts"
+        params = {
+            "underlying_ticker": underlying,
+            "limit": 1000
         }
         
         if contract_type:
-            params['contract_type'] = contract_type
+            params["contract_type"] = contract_type
         if expiration_date:
-            params['expiration_date'] = expiration_date
+            params["expiration_date"] = expiration_date
         if strike_price:
-            params['strike_price'] = strike_price
-        
-        response = self._make_request(endpoint, params)
-        results = response.get('results', [])
-        
-        if not results:
-            return pl.DataFrame()
-        
-        return pl.DataFrame(results)
+            params["strike_price"] = strike_price
+            
+        data = await self._make_request(url, params)
+        if data and data.get('status') == 'OK':
+            return data.get('results', [])
+        return []
     
-    def get_options_trades(
-        self,
-        options_ticker: str,
-        date: str,
-        timestamp_gte: Optional[str] = None,
-        timestamp_lte: Optional[str] = None,
-        limit: int = 50000
-    ) -> pl.DataFrame:
-        """Get options trades for specific contract and date"""
-        endpoint = f"/v3/trades/{options_ticker}"
+    async def get_options_quotes(self, options_ticker: str, date: str) -> List[Dict]:
+        """Get quotes for a specific options contract"""
+        url = f"{self.base_url}/v3/quotes/{options_ticker}"
         params = {
-            'timestamp.date': date,
-            'limit': limit
+            "timestamp.gte": f"{date}T00:00:00Z",
+            "timestamp.lt": f"{date}T23:59:59Z",
+            "limit": 50000
         }
         
-        if timestamp_gte:
-            params['timestamp.gte'] = timestamp_gte
-        if timestamp_lte:
-            params['timestamp.lte'] = timestamp_lte
-        
-        response = self._make_request(endpoint, params)
-        trades = response.get('results', [])
-        
-        if not trades:
-            return pl.DataFrame()
-        
-        df = pl.DataFrame(trades)
-        
-        if not df.is_empty():
-            # Parse options ticker to extract contract details
-            contract_info = self._parse_options_ticker(options_ticker)
-            
-            df = df.rename({
-                't': 'timestamp_ns',
-                'p': 'price',
-                's': 'size',
-                'x': 'exchange',
-                'c': 'conditions'
-            })
-            
-            df = df.with_columns([
-                pl.from_epoch(pl.col('timestamp_ns'), time_unit='ns').alias('timestamp_utc'),
-                pl.lit(options_ticker).alias('symbol'),
-                pl.lit(contract_info['underlying']).alias('underlying_symbol'),
-                pl.lit(contract_info['type']).alias('contract_type'),
-                pl.lit(contract_info['strike']).alias('strike_price'),
-                pl.lit(contract_info['expiration']).alias('expiration_date')
-            ])
-        
-        return df
+        data = await self._make_request(url, params)
+        if data and data.get('status') == 'OK':
+            return data.get('results', [])
+        return []
+
+
+class BatchProcessor:
+    """
+    Process large batches of tickers efficiently
+    Designed to handle 5000+ symbols with proper resource management
+    """
     
-    def get_options_aggregates(
-        self,
-        options_ticker: str,
-        multiplier: int = 1,
-        timespan: str = 'minute',
-        from_date: str = None,
-        to_date: str = None,
-        limit: int = 50000
-    ) -> pl.DataFrame:
-        """Get options aggregate bars"""
-        endpoint = f"/v2/aggs/ticker/{options_ticker}/range/{multiplier}/{timespan}/{from_date}/{to_date}"
-        params = {'limit': limit, 'adjusted': 'true', 'sort': 'asc'}
+    def __init__(self, batch_size: int = 50, max_workers: int = 4):
+        self.batch_size = batch_size
+        self.max_workers = max_workers
         
-        response = self._make_request(endpoint, params)
-        results = response.get('results', [])
+    async def process_symbols_batch(self, 
+                                  symbols: List[str], 
+                                  process_func: Callable,
+                                  *args, **kwargs) -> Dict[str, any]:
+        """
+        Process a large list of symbols in batches
+        """
+        results = {}
+        total_symbols = len(symbols)
         
-        if not results:
-            return pl.DataFrame()
+        logger.info(f"Processing {total_symbols} symbols in batches of {self.batch_size}")
         
-        df = pl.DataFrame(results)
+        # Split symbols into batches
+        batches = [symbols[i:i + self.batch_size] 
+                  for i in range(0, len(symbols), self.batch_size)]
         
-        if not df.is_empty():
-            contract_info = self._parse_options_ticker(options_ticker)
+        for batch_idx, batch in enumerate(batches):
+            logger.info(f"Processing batch {batch_idx + 1}/{len(batches)} ({len(batch)} symbols)")
             
-            df = df.rename({
-                't': 'timestamp_ms',
-                'o': 'open',
-                'h': 'high',
-                'l': 'low', 
-                'c': 'close',
-                'v': 'volume',
-                'vw': 'vwap',
-                'n': 'transactions'
-            })
+            # Process batch concurrently
+            tasks = [process_func(symbol, *args, **kwargs) for symbol in batch]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            df = df.with_columns([
-                pl.from_epoch(pl.col('timestamp_ms'), time_unit='ms').alias('timestamp_utc'),
-                pl.lit(options_ticker).alias('symbol'),
-                pl.lit(contract_info['underlying']).alias('underlying_symbol'),
-                pl.lit(contract_info['type']).alias('contract_type'),
-                pl.lit(contract_info['strike']).alias('strike_price'),
-                pl.lit(contract_info['expiration']).alias('expiration_date')
-            ])
+            # Collect results
+            for symbol, result in zip(batch, batch_results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error processing {symbol}: {result}")
+                    results[symbol] = None
+                else:
+                    results[symbol] = result
+            
+            # Brief pause between batches to be respectful to the API
+            if batch_idx < len(batches) - 1:
+                await asyncio.sleep(1)
         
-        return df
+        success_count = sum(1 for r in results.values() if r is not None)
+        logger.info(f"Batch processing complete: {success_count}/{total_symbols} successful")
+        
+        return results
+
+
+# scripts/ingest_market_data.py
+import asyncio
+import sys
+from pathlib import Path
+from datetime import datetime, timedelta
+import logging
+import json
+from dotenv import load_dotenv  # Add this import
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Add project root to path
+sys.path.append(str(Path(__file__).parent.parent))
+
+from src.ingestion.polygon_client import PolygonClient, RateLimitConfig, BatchProcessor
+from config.settings import trading_config, db_config, LOGS_DIR
+
+# Setup logging
+LOGS_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[
+        logging.FileHandler(LOGS_DIR / 'data_ingestion.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class MarketDataIngester:
+    """
+    Main data ingestion orchestrator
+    Coordinates the fetching and storage of market data for all symbols
+    """
     
-    def _parse_options_ticker(self, ticker: str) -> Dict[str, Any]:
-        """
-        Parse options ticker to extract contract details
-        Example: 'AAPL250117C00150000' -> {underlying: 'AAPL', expiration: '2025-01-17', type: 'call', strike: 150.0}
-        """
+    def __init__(self, polygon_api_key: str, test_mode: bool = True):
+        self.polygon_api_key = polygon_api_key
+        self.test_mode = test_mode
+        
+        # For testing, use a subset of symbols
+        if test_mode:
+            self.symbols = ["AAPL", "GOOGL", "MSFT", "TSLA", "SPY"]
+            logger.info(f"TEST MODE: Using {len(self.symbols)} symbols")
+        else:
+            # In production, this would load from a file or database
+            self.symbols = trading_config.stock_symbols
+            logger.info(f"PRODUCTION MODE: Using {len(self.symbols)} symbols")
+        
+        # Configure rate limiting for Advanced tier subscriptions
+        # Advanced tier: Much higher limits, can be more aggressive
+        self.rate_limit_config = RateLimitConfig(
+            requests_per_minute=1000,  # Advanced tier limit
+            concurrent_requests=25,    # Higher concurrency for faster processing
+            retry_attempts=3
+        )
+        
+        self.batch_processor = BatchProcessor(batch_size=50, max_workers=8)  # Larger batches for advanced tier
+    
+    async def fetch_stock_data_for_symbol(self, symbol: str, from_date: str, to_date: str) -> Dict:
+        """Fetch stock data for a single symbol"""
         try:
-            # Standard format: SYMBOL + YYMMDD + C/P + Strike*1000
-            underlying = ''
-            i = 0
-            
-            # Extract underlying symbol (letters at start)
-            while i < len(ticker) and ticker[i].isalpha():
-                underlying += ticker[i]
-                i += 1
-            
-            # Extract date (6 digits)
-            date_str = ticker[i:i+6]
-            exp_date = f"20{date_str[:2]}-{date_str[2:4]}-{date_str[4:6]}"
-            i += 6
-            
-            # Extract call/put
-            contract_type = 'call' if ticker[i] == 'C' else 'put'
-            i += 1
-            
-            # Extract strike price
-            strike_str = ticker[i:]
-            strike_price = float(strike_str) / 1000
-            
-            return {
-                'underlying': underlying,
-                'expiration': exp_date,
-                'type': contract_type,
-                'strike': strike_price
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to parse options ticker {ticker}: {e}")
-            return {
-                'underlying': ticker,
-                'expiration': None,
-                'type': None,
-                'strike': None
-            }
-    
-    # WEBSOCKET STREAMING METHODS
-    
-    async def stream_market_data(
-        self,
-        symbols: List[str],
-        data_types: List[str] = None
-    ) -> AsyncGenerator[Dict, None]:
-        """
-        Stream real-time market data via WebSocket
-        
-        Args:
-            symbols: List of symbols to subscribe to
-            data_types: List of data types ('T' for trades, 'A' for aggregates)
-        
-        Yields:
-            Real-time market data messages
-        """
-        if data_types is None:
-            data_types = ['T', 'A']  # Trades and aggregates
-        
-        uri = f"{self.config.websocket_url}/stocks"
-        
-        try:
-            async with websockets.connect(uri) as websocket:
-                # Authenticate
-                auth_message = {
-                    "action": "auth",
-                    "params": self.config.api_key
+            async with PolygonClient(self.polygon_api_key, self.rate_limit_config) as client:
+                # Get minute-level data
+                minute_data = await client.get_stock_bars(
+                    symbol=symbol,
+                    from_date=from_date,
+                    to_date=to_date,
+                    timespan="minute",
+                    multiplier=1
+                )
+                
+                # Get daily data for longer-term features
+                daily_data = await client.get_stock_bars(
+                    symbol=symbol,
+                    from_date=from_date,
+                    to_date=to_date,
+                    timespan="day",
+                    multiplier=1
+                )
+                
+                return {
+                    'symbol': symbol,
+                    'minute_data': minute_data,
+                    'daily_data': daily_data,
+                    'timestamp': datetime.now().isoformat()
                 }
-                await websocket.send(json.dumps(auth_message))
                 
-                # Subscribe to symbols
-                for data_type in data_types:
-                    subscribe_message = {
-                        "action": "subscribe",
-                        "params": f"{data_type}.{','.join(symbols)}"
-                    }
-                    await websocket.send(json.dumps(subscribe_message))
+        except Exception as e:
+            logger.error(f"Error fetching data for {symbol}: {e}")
+            return None
+    
+    async def fetch_options_data_for_symbol(self, symbol: str, date: str) -> Dict:
+        """Fetch options data for a single symbol"""
+        try:
+            async with PolygonClient(self.polygon_api_key, self.rate_limit_config) as client:
+                # Get options contracts
+                contracts = await client.get_options_contracts(
+                    underlying=symbol,
+                    expiration_date=date
+                )
                 
-                # Listen for messages
-                async for message in websocket:
-                    try:
-                        data = json.loads(message)
-                        if isinstance(data, list):
-                            for item in data:
-                                yield item
-                        else:
-                            yield data
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Failed to decode WebSocket message: {e}")
-                        
+                return {
+                    'symbol': symbol,
+                    'contracts': contracts,
+                    'date': date,
+                    'timestamp': datetime.now().isoformat()
+                }
+                
         except Exception as e:
-            logger.error(f"WebSocket connection failed: {e}")
-            raise
+            logger.error(f"Error fetching options data for {symbol}: {e}")
+            return None
     
-    # DATA EXPORT METHODS
-    
-    def save_to_parquet(
-        self,
-        df: pl.DataFrame,
-        file_path: Union[str, Path],
-        partition_cols: List[str] = None
-    ) -> None:
-        """Save DataFrame to parquet file with optional partitioning"""
-        file_path = Path(file_path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
+    async def run_stock_data_ingestion(self, days_back: int = 7):
+        """Run stock data ingestion for all symbols"""
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days_back)
         
-        try:
-            if partition_cols:
-                df.write_parquet(file_path, partition_by=partition_cols)
-            else:
-                df.write_parquet(file_path)
-            logger.info(f"Data saved to {file_path}")
-        except Exception as e:
-            logger.error(f"Failed to save parquet file: {e}")
-            raise
-    
-    def save_to_csv(self, df: pl.DataFrame, file_path: Union[str, Path]) -> None:
-        """Save DataFrame to CSV file"""
-        file_path = Path(file_path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
+        from_date = start_date.strftime('%Y-%m-%d')
+        to_date = end_date.strftime('%Y-%m-%d')
         
-        try:
-            df.write_csv(file_path)
-            logger.info(f"Data saved to {file_path}")
-        except Exception as e:
-            logger.error(f"Failed to save CSV file: {e}")
-            raise
-    
-    # UTILITY METHODS
-    
-    def get_trading_days(self, start_date: str, end_date: str) -> List[str]:
-        """Get list of trading days between start and end date"""
-        try:
-            calendar = self.get_market_calendar(start_date, end_date)
-            
-            if not calendar:
-                logger.warning("No market calendar data returned")
-                return []
-            
-            # Handle different calendar data structures
-            trading_days = []
-            for day in calendar:
-                if isinstance(day, dict):
-                    # Look for date field in various possible keys
-                    date_value = day.get('date') or day.get('day') or day.get('trading_date')
-                    status = day.get('status', 'unknown')
-                    
-                    if date_value and status in ['open', 'early_close']:
-                        trading_days.append(date_value)
-                elif isinstance(day, str):
-                    # Sometimes the response might just be a list of date strings
-                    trading_days.append(day)
-            
-            return trading_days
-            
-        except Exception as e:
-            logger.error(f"Failed to get trading days: {e}")
-            # Fallback: generate weekdays (excluding weekends)
-            from datetime import datetime, timedelta
-            
-            start = datetime.strptime(start_date, '%Y-%m-%d')
-            end = datetime.strptime(end_date, '%Y-%m-%d')
-            
-            trading_days = []
-            current = start
-            while current <= end:
-                # Skip weekends (Monday=0, Sunday=6)
-                if current.weekday() < 5:  # Monday to Friday
-                    trading_days.append(current.strftime('%Y-%m-%d'))
-                current += timedelta(days=1)
-            
-            logger.info(f"Using fallback weekday calculation: {len(trading_days)} days")
-            return trading_days
-    
-    def batch_download_historical(
-        self,
-        symbols: List[str],
-        start_date: str,
-        end_date: str,
-        data_type: DataType,
-        output_dir: Union[str, Path]
-    ) -> None:
-        """
-        Batch download historical data for multiple symbols
+        logger.info(f"Starting stock data ingestion from {from_date} to {to_date}")
         
-        Args:
-            symbols: List of symbols to download
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)  
-            data_type: Type of data to download
-            output_dir: Directory to save files
-        """
-        output_dir = Path(output_dir)
+        # Process all symbols in batches
+        results = await self.batch_processor.process_symbols_batch(
+            symbols=self.symbols,
+            process_func=self.fetch_stock_data_for_symbol,
+            from_date=from_date,
+            to_date=to_date
+        )
         
-        trading_days = self.get_trading_days(start_date, end_date)
+        # Save results (Bronze layer - raw data)
+        await self._save_raw_data(results, 'stock_data', from_date, to_date)
         
-        for symbol in symbols:
-            logger.info(f"Downloading {data_type.value} for {symbol}")
-            
-            for date in trading_days:
-                try:
-                    if data_type == DataType.STOCK_TRADES:
-                        df = self.get_stock_trades(symbol, date)
-                    elif data_type == DataType.STOCK_AGGREGATES:
-                        df = self.get_stock_aggregates(
-                            symbol, from_date=date, to_date=date
-                        )
-                    elif data_type == DataType.OPTIONS_TRADES:
-                        df = self.get_options_trades(symbol, date)
-                    elif data_type == DataType.OPTIONS_AGGREGATES:
-                        df = self.get_options_aggregates(
-                            symbol, from_date=date, to_date=date
-                        )
-                    else:
-                        logger.warning(f"Unsupported data type: {data_type}")
-                        continue
-                    
-                    if not df.is_empty():
-                        filename = f"{data_type.value}_{symbol}_{date.replace('-', '')}.parquet"
-                        file_path = output_dir / f"date={date}" / filename
-                        self.save_to_parquet(df, file_path)
-                    
-                except Exception as e:
-                    logger.error(f"Failed to download {symbol} for {date}: {e}")
-                    continue
+        return results
     
-    def __enter__(self):
-        return self
+    async def run_options_data_ingestion(self, target_date: str = None):
+        """Run options data ingestion for all symbols"""
+        if target_date is None:
+            target_date = datetime.now().strftime('%Y-%m-%d')
+        
+        logger.info(f"Starting options data ingestion for {target_date}")
+        
+        results = await self.batch_processor.process_symbols_batch(
+            symbols=self.symbols,
+            process_func=self.fetch_options_data_for_symbol,
+            date=target_date
+        )
+        
+        # Save results (Bronze layer - raw data)
+        await self._save_raw_data(results, 'options_data', target_date)
+        
+        return results
     
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.session.close()
+    async def _save_raw_data(self, data: Dict, data_type: str, *date_parts):
+        """Save raw data to Bronze layer (JSON files for now)"""
+        from config.settings import DATA_DIR
+        
+        bronze_dir = DATA_DIR / "bronze" / data_type
+        bronze_dir.mkdir(parents=True, exist_ok=True)
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{data_type}_{'-'.join(date_parts)}_{timestamp}.json"
+        filepath = bronze_dir / filename
+        
+        # Filter out None results and save
+        clean_data = {k: v for k, v in data.items() if v is not None}
+        
+        with open(filepath, 'w') as f:
+            json.dump(clean_data, f, indent=2, default=str)
+        
+        logger.info(f"Saved {len(clean_data)} records to {filepath}")
 
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Example configuration (use environment variables in production)
-    config = PolygonConfig(
-        api_key="YOUR_API_KEY_HERE",  # Replace with actual API key
-        rate_limit_per_minute=100
+async def main():
+    """Main execution function"""
+    import os
+    
+    # Get API key from environment
+    api_key = os.getenv('POLYGON_API_KEY')
+    if not api_key:
+        logger.error("POLYGON_API_KEY environment variable not set")
+        return
+    
+    # Create ingester
+    ingester = MarketDataIngester(
+        polygon_api_key=api_key,
+        test_mode=True  # Set to False for production
     )
     
-    with PolygonClient(config) as client:
-        # Test market status
-        print("Market Status:", client.get_market_status())
+    try:
+        # Run stock data ingestion
+        logger.info("=== Starting Stock Data Ingestion ===")
+        stock_results = await ingester.run_stock_data_ingestion(days_back=3)
         
-        # Test stock data
-        stock_df = client.get_stock_aggregates(
-            "AAPL", 
-            from_date="2024-01-01", 
-            to_date="2024-01-01"
-        )
-        print(f"Stock data shape: {stock_df.shape}")
+        # Run options data ingestion
+        logger.info("=== Starting Options Data Ingestion ===")
+        options_results = await ingester.run_options_data_ingestion()
         
-        # Test options contracts
-        contracts_df = client.get_options_contracts("AAPL", limit=10)
-        print(f"Options contracts shape: {contracts_df.shape}")
+        logger.info("=== Data Ingestion Complete ===")
+        logger.info(f"Stock data: {len([r for r in stock_results.values() if r])}/{len(stock_results)} successful")
+        logger.info(f"Options data: {len([r for r in options_results.values() if r])}/{len(options_results)} successful")
+        
+    except Exception as e:
+        logger.error(f"Data ingestion failed: {e}")
+        raise
+
+if __name__ == "__main__":
+    asyncio.run(main())
