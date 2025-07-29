@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 def create_missing_essential_files():
     """Create missing essential files for production"""
     
-    project_root = Path(__file__).parent.parent
+    project_root = Path(__file__).parent.parent  # Go up from scripts/ to project root.parent  # Go up from scripts/ to project root.parent  # Go up from scripts/ to project root.parent  # Go up from scripts/ to project root.parent
     
     # Create .env.example
     env_example = project_root / "config" / ".env.example"

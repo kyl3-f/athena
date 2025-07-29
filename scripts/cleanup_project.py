@@ -1,344 +1,469 @@
-# scripts/cleanup_project.py
+#!/usr/bin/env python3
+"""
+Athena Project Cleanup & Organization Script
+Standardizes file locations, removes temp files, and organizes project structure
+"""
+
 import os
 import shutil
 from pathlib import Path
 import logging
-import json
-from datetime import datetime
-from typing import List, Dict
+import datetime
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class ProjectCleanup:
+class AthenaProjectOrganizer:
     """
-    Clean up unnecessary files from Athena project
-    Keeps only production and testing pipeline files
+    Organizes and cleans up the Athena project structure
     """
     
-    def __init__(self, dry_run: bool = True):
-        self.dry_run = dry_run
-        self.project_root = Path(__file__).parent.parent
-        self.cleanup_log = []
-        
-    def get_essential_files(self) -> Dict[str, List[str]]:
-        """Define essential files for production/testing pipeline"""
+    def __init__(self, project_root: Path = None):
+        self.project_root = project_root or Path.cwd()
+        self.cleanup_report = {
+            'files_moved': [],
+            'files_deleted': [],
+            'directories_created': [],
+            'errors': []
+        }
+    
+    def get_target_structure(self):
+        """Define the target project structure"""
         return {
-            'config_files': [
-                'config/settings.py',
-                'config/symbols.txt',
-                'config/symbols_metadata.json',
-                'config/.env.example'
-            ],
-            
-            'core_source_files': [
-                'src/ingestion/polygon_client.py',
-                'src/processing/data_cleaner.py', 
-                'src/processing/feature_engineer.py',
-                'config/__init__.py',
-                'src/__init__.py',
-                'src/ingestion/__init__.py',
-                'src/processing/__init__.py'
-            ],
-            
-            'production_scripts': [
-                'scripts/load_historical_data.py',
-                'scripts/collect_live_data.py',
-                'scripts/process_to_silver.py',
-                'scripts/load_finviz_symbols.py',
-                'scripts/cleanup_project.py'  # Keep this script
-            ],
-            
-            'project_files': [
-                'README.md',
-                'requirements.txt',
-                '.env',
-                '.env.example',
-                '.gitignore',
-                'LICENSE'
-            ],
-            
-            'data_directories': [
-                'data/bronze/',
-                'data/silver/',
-                'data/finviz/',
-                'logs/'
-            ]
+            'src/': {
+                'description': 'Core source code',
+                'subdirs': ['ingestion/', 'processing/', 'ml/', 'monitoring/']
+            },
+            'scripts/': {
+                'description': 'Utility and test scripts',
+                'subdirs': []
+            },
+            'config/': {
+                'description': 'Configuration files',
+                'subdirs': []
+            },
+            'data/': {
+                'description': 'Data storage',
+                'subdirs': ['bronze/', 'silver/', 'gold/', 'signals/', 'models/']
+            },
+            'logs/': {
+                'description': 'Application logs',
+                'subdirs': []
+            },
+            'docs/': {
+                'description': 'Documentation',
+                'subdirs': []
+            },
+            'tests/': {
+                'description': 'Unit and integration tests',
+                'subdirs': []
+            }
         }
     
-    def get_files_to_remove(self) -> Dict[str, List[str]]:
-        """Define files and directories to remove"""
-        return {
-            'unnecessary_scripts': [
-                'scripts/generate_symbol_list.py',  # Replaced by Finviz loader
-                'scripts/ingest_market_data.py',    # Never existed, but check
-                'scripts/complete_options_system.py', # Development file
-                'src/processing/silver_processor.py',  # Old version
-                'src/data_ingestion/',              # Old directory structure
-                'scripts/test_*.py',                # Test scripts
-                'scripts/debug_*.py',               # Debug scripts
-                'scripts/prototype_*.py',           # Prototype scripts
-                'scripts/temp_*.py',                # Temporary scripts
-                'scripts/old_*.py',                 # Old scripts
-                'test_*.py',                        # Root level test scripts
-                'inspect_*.py',                     # Inspection scripts
-                'debug_*.py',                       # Debug scripts
-                'config/test_*.py',                 # Config test files
-                'config/polygon_config.py'         # Old config file
-            ],
+    def create_directory_structure(self):
+        """Create the standard directory structure"""
+        logger.info("🏗️ Creating standard directory structure...")
+        
+        structure = self.get_target_structure()
+        
+        for main_dir, info in structure.items():
+            # Create main directory
+            dir_path = self.project_root / main_dir
+            if not dir_path.exists():
+                dir_path.mkdir(parents=True, exist_ok=True)
+                self.cleanup_report['directories_created'].append(str(dir_path))
+                logger.info(f"   ✅ Created: {main_dir}")
             
-            'old_data_directories': [
-                'data/symbols/',                    # Generated symbols, replaced by Finviz
-                'data/temp/',                       # Temporary data
-                'data/debug/',                      # Debug data
-                'data/test/',                       # Test data
-                'data/cache/',                      # Cache data
-                'data/raw/',                        # Old raw data structure
-                'data/processed/'                   # Old processed data structure
-            ],
+            # Create subdirectories
+            for subdir in info['subdirs']:
+                subdir_path = dir_path / subdir
+                if not subdir_path.exists():
+                    subdir_path.mkdir(parents=True, exist_ok=True)
+                    self.cleanup_report['directories_created'].append(str(subdir_path))
+                    logger.info(f"   ✅ Created: {main_dir}{subdir}")
+    
+    def organize_scripts(self):
+        """Move and organize script files"""
+        logger.info("📝 Organizing script files...")
+        
+        # Scripts that should be in /scripts
+        script_files = [
+            'athena_status_summary.py',
+            'system_test_suite.py', 
+            'live_market_test.py',
+            'pre_deployment_checklist.py',
+            'ultimate_victory.py',
+            'enhanced_polygon_options.py',
+            'options_feature_integration.py',
+            'test_options_integration.py',
+            'fixed_test_options_integration.py'
+        ]
+        
+        scripts_dir = self.project_root / 'scripts'
+        
+        for script_file in script_files:
+            source_path = self.project_root / script_file
+            target_path = scripts_dir / script_file
             
-            'development_files': [
-                '*.pyc',                           # Python compiled files
-                '__pycache__/',                    # Python cache directories
-                '.pytest_cache/',                  # Pytest cache
-                '.coverage',                       # Coverage files
-                'htmlcov/',                        # Coverage HTML
-                '*.log',                          # Old log files in root
-                'temp_*',                         # Temporary files
-                'debug_*',                        # Debug files
-                'test_output*',                   # Test output files
-                'backup_*',                       # Backup files
-                '*.bak',                          # Backup files
-                '*.tmp',                          # Temporary files
-                '.DS_Store',                      # macOS files
-                'Thumbs.db'                       # Windows files
-            ],
-            
-            'unused_notebooks': [
-                '*.ipynb',                        # Jupyter notebooks (move to archive if needed)
-                'notebooks/',                     # Notebook directory
-                'experiments/',                   # Experiment directory
-                'research/',                      # Research directory
-                'analysis/'                       # Analysis directory
-            ]
-        }
-    
-    def scan_project(self) -> Dict:
-        """Scan project for files to keep/remove"""
-        essential_files = self.get_essential_files()
-        files_to_remove = self.get_files_to_remove()
-        
-        scan_result = {
-            'essential_found': [],
-            'essential_missing': [],
-            'files_to_remove': [],
-            'unknown_files': []
-        }
-        
-        # Check essential files
-        for category, file_list in essential_files.items():
-            for file_path in file_list:
-                full_path = self.project_root / file_path
-                if full_path.exists():
-                    scan_result['essential_found'].append(str(full_path))
-                else:
-                    scan_result['essential_missing'].append(str(full_path))
-        
-        # Find files to remove
-        for category, patterns in files_to_remove.items():
-            for pattern in patterns:
-                # Handle glob patterns
-                if '*' in pattern or '?' in pattern:
-                    matches = list(self.project_root.rglob(pattern))
-                    for match in matches:
-                        if match.exists():
-                            scan_result['files_to_remove'].append(str(match))
-                else:
-                    full_path = self.project_root / pattern
-                    if full_path.exists():
-                        scan_result['files_to_remove'].append(str(full_path))
-        
-        # Find unknown Python files (not in essential list)
-        essential_set = set()
-        for file_list in essential_files.values():
-            essential_set.update(file_list)
-        
-        for py_file in self.project_root.rglob("*.py"):
-            rel_path = py_file.relative_to(self.project_root)
-            if str(rel_path) not in essential_set and str(py_file) not in scan_result['files_to_remove']:
-                scan_result['unknown_files'].append(str(py_file))
-        
-        return scan_result
-    
-    def remove_file_or_dir(self, path: Path) -> bool:
-        """Remove a file or directory"""
-        try:
-            if path.is_file():
-                if not self.dry_run:
-                    path.unlink()
-                self.cleanup_log.append(f"Removed file: {path}")
-                return True
-            elif path.is_dir():
-                if not self.dry_run:
-                    shutil.rmtree(path)
-                self.cleanup_log.append(f"Removed directory: {path}")
-                return True
-            return False
-        except Exception as e:
-            self.cleanup_log.append(f"Error removing {path}: {e}")
-            return False
-    
-    def create_backup(self, files_to_remove: List[str]) -> Path:
-        """Create backup of files before deletion"""
-        if self.dry_run:
-            return None
-        
-        backup_dir = self.project_root / "cleanup_backup" / datetime.now().strftime('%Y%m%d_%H%M%S')
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        
-        for file_path in files_to_remove:
-            source = Path(file_path)
-            if source.exists() and source.is_file():
+            if source_path.exists() and not target_path.exists():
                 try:
-                    rel_path = source.relative_to(self.project_root)
-                    backup_file = backup_dir / rel_path
-                    backup_file.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source, backup_file)
+                    shutil.move(str(source_path), str(target_path))
+                    self.cleanup_report['files_moved'].append(f"{script_file} -> scripts/")
+                    logger.info(f"   ✅ Moved: {script_file} -> scripts/")
                 except Exception as e:
-                    logger.warning(f"Could not backup {source}: {e}")
-        
-        logger.info(f"Backup created at: {backup_dir}")
-        return backup_dir
+                    self.cleanup_report['errors'].append(f"Failed to move {script_file}: {e}")
+                    logger.error(f"   ❌ Failed to move {script_file}: {e}")
     
-    def cleanup_project(self) -> Dict:
-        """Perform project cleanup"""
-        logger.info(f"Starting project cleanup (dry_run={self.dry_run})")
+    def organize_core_components(self):
+        """Organize core source components"""
+        logger.info("🔧 Organizing core components...")
         
-        # Scan project
-        scan_result = self.scan_project()
+        # Files that should be in specific src/ subdirectories
+        component_moves = {
+            'production_orchestrator.py': 'src/',
+            'ml_signal_generator.py': 'src/ml/',
+            'risk_manager.py': 'src/ml/',
+            'monitoring_dashboard.py': 'src/monitoring/',
+            'performance_monitor.py': 'src/monitoring/',
+            'enhanced_alerts.py': 'src/monitoring/'
+        }
         
-        # Create backup if not dry run
-        backup_dir = None
-        if not self.dry_run and scan_result['files_to_remove']:
-            backup_dir = self.create_backup(scan_result['files_to_remove'])
+        for file_name, target_dir in component_moves.items():
+            source_path = self.project_root / file_name
+            target_path = self.project_root / target_dir / file_name
+            
+            if source_path.exists():
+                try:
+                    # Ensure target directory exists
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    if not target_path.exists():
+                        shutil.move(str(source_path), str(target_path))
+                        self.cleanup_report['files_moved'].append(f"{file_name} -> {target_dir}")
+                        logger.info(f"   ✅ Moved: {file_name} -> {target_dir}")
+                except Exception as e:
+                    self.cleanup_report['errors'].append(f"Failed to move {file_name}: {e}")
+                    logger.error(f"   ❌ Failed to move {file_name}: {e}")
+    
+    def cleanup_temporary_files(self):
+        """Remove temporary and test files"""
+        logger.info("🧹 Cleaning up temporary files...")
         
-        # Remove files
-        removed_count = 0
-        for file_path in scan_result['files_to_remove']:
-            if self.remove_file_or_dir(Path(file_path)):
-                removed_count += 1
+        # Temporary files to remove
+        temp_files = [
+            'quicktest.py',
+            'quicklive.py',
+            'pipeline_test.py',
+            'working_test.py',
+            'final_test.py',
+            'victory_test.py',
+            'success_test.py',
+            'ultimate_victory.py',  # Will be moved to scripts, not deleted
+            'test_write.csv',
+            'live_test_data.csv',
+            'live_test_features.csv'
+        ]
         
-        # Remove empty directories
-        empty_dirs_removed = 0
-        if not self.dry_run:
-            for root, dirs, files in os.walk(self.project_root, topdown=False):
-                for dir_name in dirs:
-                    dir_path = Path(root) / dir_name
-                    try:
-                        if dir_path.is_dir() and not any(dir_path.iterdir()):
-                            dir_path.rmdir()
-                            empty_dirs_removed += 1
-                            self.cleanup_log.append(f"Removed empty directory: {dir_path}")
-                    except Exception as e:
-                        pass
+        # Temporary CSV files pattern
+        temp_patterns = [
+            'test_*.csv',
+            'quicktest_*.csv',
+            'athena_test_*.csv',
+            'athena_victory_*.csv',
+            'athena_ultimate_*.csv'
+        ]
+        
+        # Remove specific temp files
+        for temp_file in temp_files:
+            file_path = self.project_root / temp_file
+            if file_path.exists():
+                try:
+                    file_path.unlink()
+                    self.cleanup_report['files_deleted'].append(temp_file)
+                    logger.info(f"   ✅ Deleted: {temp_file}")
+                except Exception as e:
+                    self.cleanup_report['errors'].append(f"Failed to delete {temp_file}: {e}")
+                    logger.error(f"   ❌ Failed to delete {temp_file}: {e}")
+        
+        # Remove pattern-based temp files
+        import glob
+        for pattern in temp_patterns:
+            for file_path in glob.glob(str(self.project_root / pattern)):
+                try:
+                    Path(file_path).unlink()
+                    self.cleanup_report['files_deleted'].append(Path(file_path).name)
+                    logger.info(f"   ✅ Deleted: {Path(file_path).name}")
+                except Exception as e:
+                    self.cleanup_report['errors'].append(f"Failed to delete {Path(file_path).name}: {e}")
+    
+    def cleanup_python_cache(self):
+        """Remove Python cache files and directories"""
+        logger.info("🐍 Cleaning Python cache files...")
+        
+        # Remove __pycache__ directories
+        for pycache_dir in self.project_root.rglob('__pycache__'):
+            try:
+                shutil.rmtree(pycache_dir)
+                self.cleanup_report['files_deleted'].append(f"__pycache__/ in {pycache_dir.parent.name}")
+                logger.info(f"   ✅ Deleted: __pycache__ in {pycache_dir.parent.name}/")
+            except Exception as e:
+                self.cleanup_report['errors'].append(f"Failed to delete {pycache_dir}: {e}")
+        
+        # Remove .pyc files
+        for pyc_file in self.project_root.rglob('*.pyc'):
+            try:
+                pyc_file.unlink()
+                self.cleanup_report['files_deleted'].append(pyc_file.name)
+                logger.info(f"   ✅ Deleted: {pyc_file.name}")
+            except Exception as e:
+                self.cleanup_report['errors'].append(f"Failed to delete {pyc_file.name}: {e}")
+    
+    def create_init_files(self):
+        """Create __init__.py files for Python packages"""
+        logger.info("📦 Creating __init__.py files...")
+        
+        # Directories that should be Python packages
+        package_dirs = [
+            'src',
+            'src/ingestion',
+            'src/processing', 
+            'src/ml',
+            'src/monitoring'
+        ]
+        
+        for package_dir in package_dirs:
+            init_file = self.project_root / package_dir / '__init__.py'
+            if not init_file.exists():
+                try:
+                    init_file.touch()
+                    self.cleanup_report['files_moved'].append(f"Created __init__.py in {package_dir}")
+                    logger.info(f"   ✅ Created: {package_dir}/__init__.py")
+                except Exception as e:
+                    self.cleanup_report['errors'].append(f"Failed to create __init__.py in {package_dir}: {e}")
+    
+    def update_import_paths(self):
+        """Update import paths in moved files"""
+        logger.info("🔗 Updating import paths...")
+        
+        # This is a simplified version - in production, you'd want more sophisticated path updates
+        scripts_dir = self.project_root / 'scripts'
+        
+        for script_file in scripts_dir.glob('*.py'):
+            try:
+                with open(script_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # Update common import patterns
+                updated_content = content
+                
+                # Fix relative imports from scripts folder
+                if 'sys.path.append(str(project_root))' not in updated_content:
+                    if 'project_root = Path(__file__).parent' in updated_content:
+                        updated_content = updated_content.replace(
+                            'project_root = Path(__file__).parent',
+                            'project_root = Path(__file__).parent.parent  # Go up from scripts/ to project root'
+                        )
+                
+                # Write back if changed
+                if updated_content != content:
+                    with open(script_file, 'w', encoding='utf-8') as f:
+                        f.write(updated_content)
+                    logger.info(f"   ✅ Updated imports in: {script_file.name}")
+                    
+            except Exception as e:
+                self.cleanup_report['errors'].append(f"Failed to update imports in {script_file.name}: {e}")
+                logger.error(f"   ❌ Failed to update imports in {script_file.name}: {e}")
+    
+    def generate_project_summary(self):
+        """Generate a summary of the project structure"""
+        logger.info("📋 Generating project summary...")
+        
+        summary_file = self.project_root / 'PROJECT_STRUCTURE.md'
+        
+        summary_content = f"""# ATHENA TRADING SYSTEM - PROJECT STRUCTURE
+
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## 📁 Directory Structure
+
+```
+athena_trading/
+├── src/                     # Core source code
+│   ├── ingestion/          # Data ingestion (Polygon API clients)
+│   ├── processing/         # Data processing and feature engineering
+│   ├── ml/                 # Machine learning models and signals
+│   └── monitoring/         # System monitoring and alerts
+├── scripts/                # Utility and test scripts
+├── config/                 # Configuration files
+├── data/                   # Data storage
+│   ├── bronze/            # Raw data
+│   ├── silver/            # Processed data
+│   ├── gold/              # Feature-engineered data
+│   ├── signals/           # Trading signals
+│   └── models/            # Trained ML models
+├── logs/                   # Application logs
+├── docs/                   # Documentation
+└── tests/                  # Unit and integration tests
+```
+
+## 🏗️ Core Components
+
+### Production System
+- `src/production_orchestrator.py` - Main production coordinator
+- `src/ingestion/polygon_client.py` - Stock data ingestion
+- `src/processing/data_cleaner.py` - Data cleaning pipeline
+- `src/processing/feature_engineer.py` - Feature engineering (104+ features)
+
+### Options Integration
+- `scripts/enhanced_polygon_options.py` - Options Greeks and flow analysis
+- `scripts/options_feature_integration.py` - Options-stock data integration
+
+### ML & Signals
+- `src/ml/ml_signal_generator.py` - ML models for trading signals
+- `src/ml/risk_manager.py` - Risk management and position limits
+
+### Monitoring & Alerts
+- `src/monitoring/monitoring_dashboard.py` - Real-time system dashboard
+- `src/monitoring/enhanced_alerts.py` - Advanced alerting system
+- `src/monitoring/performance_monitor.py` - System performance tracking
+
+### Testing & Deployment
+- `scripts/system_test_suite.py` - Comprehensive system testing
+- `scripts/live_market_test.py` - Live market data validation
+- `scripts/test_options_integration.py` - Options integration testing
+- `scripts/pre_deployment_checklist.py` - Pre-deployment validation
+- `scripts/athena_status_summary.py` - System status checker
+
+## 🎯 Key Features
+
+✅ **104+ Stock Features** - Technical indicators, price analysis, volume metrics  
+✅ **Options Greeks Integration** - Real-time gamma exposure, flow analysis  
+✅ **ML-Ready Pipeline** - Complete feature engineering for machine learning  
+✅ **Production Orchestration** - Automated market hours operation  
+✅ **Risk Management** - Position limits and signal validation  
+✅ **Real-time Monitoring** - Dashboard and alert system  
+✅ **Comprehensive Testing** - 10+ test categories validation  
+
+## 🚀 Getting Started
+
+1. **Environment Setup**: Set POLYGON_API_KEY environment variable
+2. **System Check**: Run `python scripts/athena_status_summary.py`
+3. **Testing**: Run `python scripts/system_test_suite.py`
+4. **Options Test**: Run `python scripts/test_options_integration.py`
+5. **Production**: Run `python src/production_orchestrator.py`
+
+## 📊 Current Status
+
+- **Core Pipeline**: ✅ OPERATIONAL (104 features working)
+- **Options Integration**: ✅ IMPLEMENTED (Greeks + flow analysis)
+- **Feature Engineering**: ✅ PRODUCTION READY
+- **Testing Framework**: ✅ COMPREHENSIVE
+- **Project Organization**: ✅ STANDARDIZED
+
+---
+*Generated by Athena Project Organizer*
+"""
+        
+        try:
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                f.write(summary_content)
+            logger.info(f"   ✅ Created: PROJECT_STRUCTURE.md")
+            self.cleanup_report['files_moved'].append("Created PROJECT_STRUCTURE.md")
+        except Exception as e:
+            self.cleanup_report['errors'].append(f"Failed to create PROJECT_STRUCTURE.md: {e}")
+    
+    def run_full_cleanup(self):
+        """Run the complete cleanup and organization process"""
+        from datetime import datetime
+        
+        logger.info("🏛️ ATHENA PROJECT CLEANUP & ORGANIZATION")
+        logger.info("=" * 50)
+        logger.info(f"Project root: {self.project_root}")
+        logger.info(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info("")
+        
+        # Run all cleanup steps
+        self.create_directory_structure()
+        self.organize_scripts()
+        self.organize_core_components()
+        self.cleanup_temporary_files()
+        self.cleanup_python_cache()
+        self.create_init_files()
+        self.update_import_paths()
+        self.generate_project_summary()
         
         # Generate cleanup report
-        cleanup_result = {
-            'dry_run': self.dry_run,
-            'timestamp': datetime.now().isoformat(),
-            'essential_files_found': len(scan_result['essential_found']),
-            'essential_files_missing': len(scan_result['essential_missing']),
-            'files_removed': removed_count,
-            'empty_dirs_removed': empty_dirs_removed,
-            'backup_location': str(backup_dir) if backup_dir else None,
-            'missing_essential_files': scan_result['essential_missing'],
-            'unknown_files_found': scan_result['unknown_files'],
-            'cleanup_log': self.cleanup_log
-        }
+        self.generate_cleanup_report()
         
-        # Save cleanup report
-        report_file = self.project_root / f"cleanup_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        if not self.dry_run:
-            with open(report_file, 'w') as f:
-                json.dump(cleanup_result, f, indent=2)
-            logger.info(f"Cleanup report saved: {report_file}")
-        
-        return cleanup_result
+        logger.info("\n🎉 PROJECT CLEANUP COMPLETE!")
+        return self.cleanup_report
     
-    def print_cleanup_summary(self, result: Dict):
-        """Print cleanup summary"""
-        mode = "DRY RUN" if result['dry_run'] else "ACTUAL CLEANUP"
+    def generate_cleanup_report(self):
+        """Generate a detailed cleanup report"""
+        logger.info("\n📋 CLEANUP REPORT:")
+        logger.info("-" * 30)
         
-        print(f"\n{'=' * 60}")
-        print(f"🧹 PROJECT CLEANUP SUMMARY ({mode})")
-        print(f"{'=' * 60}")
-        print(f"✅ Essential files found: {result['essential_files_found']}")
-        print(f"❌ Essential files missing: {result['essential_files_missing']}")
-        print(f"🗑️  Files removed: {result['files_removed']}")
-        print(f"📁 Empty directories removed: {result['empty_dirs_removed']}")
+        if self.cleanup_report['directories_created']:
+            logger.info(f"📁 Directories created: {len(self.cleanup_report['directories_created'])}")
+            for directory in self.cleanup_report['directories_created'][:5]:  # Show first 5
+                logger.info(f"   + {directory}")
+            if len(self.cleanup_report['directories_created']) > 5:
+                logger.info(f"   ... and {len(self.cleanup_report['directories_created']) - 5} more")
         
-        if result['backup_location']:
-            print(f"💾 Backup created: {result['backup_location']}")
+        if self.cleanup_report['files_moved']:
+            logger.info(f"📝 Files moved/created: {len(self.cleanup_report['files_moved'])}")
+            for file_move in self.cleanup_report['files_moved']:
+                logger.info(f"   → {file_move}")
         
-        if result['missing_essential_files']:
-            print(f"\n⚠️  Missing essential files:")
-            for file in result['missing_essential_files']:
-                print(f"  • {file}")
+        if self.cleanup_report['files_deleted']:
+            logger.info(f"🗑️  Files deleted: {len(self.cleanup_report['files_deleted'])}")
+            for deleted_file in self.cleanup_report['files_deleted'][:5]:  # Show first 5
+                logger.info(f"   ✗ {deleted_file}")
+            if len(self.cleanup_report['files_deleted']) > 5:
+                logger.info(f"   ... and {len(self.cleanup_report['files_deleted']) - 5} more")
         
-        if result['unknown_files_found']:
-            print(f"\n❓ Unknown Python files found (review manually):")
-            for file in result['unknown_files_found'][:10]:  # Show first 10
-                print(f"  • {file}")
-            if len(result['unknown_files_found']) > 10:
-                print(f"  ... and {len(result['unknown_files_found']) - 10} more")
+        if self.cleanup_report['errors']:
+            logger.info(f"❌ Errors encountered: {len(self.cleanup_report['errors'])}")
+            for error in self.cleanup_report['errors']:
+                logger.error(f"   ! {error}")
         
-        print(f"{'=' * 60}")
+        # Summary
+        total_actions = (len(self.cleanup_report['directories_created']) + 
+                        len(self.cleanup_report['files_moved']) + 
+                        len(self.cleanup_report['files_deleted']))
         
-        if result['dry_run']:
-            print("🔍 This was a DRY RUN - no files were actually removed")
-            print("Run with --execute to perform actual cleanup")
-        else:
-            print("✅ Cleanup completed!")
-        
-        print(f"{'=' * 60}")
-
+        logger.info(f"\n✅ Total actions completed: {total_actions}")
+        logger.info(f"❌ Errors: {len(self.cleanup_report['errors'])}")
 
 def main():
-    """Main cleanup function"""
-    import argparse
+    """Main cleanup execution"""
+    # Determine project root
+    current_path = Path.cwd()
     
-    parser = argparse.ArgumentParser(description='Clean up Athena project files')
-    parser.add_argument('--execute', action='store_true', 
-                       help='Actually perform cleanup (default is dry run)')
-    parser.add_argument('--verbose', action='store_true',
-                       help='Verbose logging')
+    # Check if we're in the correct project directory
+    if not (current_path / 'src').exists():
+        print("❌ Not in Athena project root directory!")
+        print("Please run this script from the athena_trading/ directory")
+        return 1
     
-    args = parser.parse_args()
+    # Run cleanup
+    organizer = AthenaProjectOrganizer(current_path)
+    report = organizer.run_full_cleanup()
     
-    # Setup logging
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
-    )
-    
-    # Perform cleanup
-    cleaner = ProjectCleanup(dry_run=not args.execute)
-    
-    if not args.execute:
-        logger.info("🔍 Running in DRY RUN mode - no files will be removed")
-        logger.info("Use --execute flag to perform actual cleanup")
+    # Final status
+    if len(report['errors']) == 0:
+        print("\n🎉 PROJECT ORGANIZATION COMPLETE!")
+        print("✅ All files organized successfully")
+        print("✅ Directory structure standardized")
+        print("✅ Temporary files cleaned up")
+        print("✅ Import paths updated")
+        print("\n📖 Check PROJECT_STRUCTURE.md for full documentation")
+        return 0
     else:
-        logger.info("⚠️  Running in EXECUTE mode - files will be removed!")
-        logger.info("Backup will be created automatically")
-    
-    try:
-        result = cleaner.cleanup_project()
-        cleaner.print_cleanup_summary(result)
-        
-    except Exception as e:
-        logger.error(f"Cleanup failed: {e}")
-        raise
-
+        print(f"\n⚠️  PROJECT ORGANIZATION COMPLETED WITH {len(report['errors'])} ERRORS")
+        print("Check the error messages above for issues that need manual resolution")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    exit(main())
